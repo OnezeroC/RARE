@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+.agents/
+.codex/
+
+HANDOFF_RARE_CONTEXT_ZH.md
+
+data/
+results/
+reports/
