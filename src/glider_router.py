@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 
@@ -33,13 +34,23 @@ def _resolve_sentence_transformer_path(model_name_or_path: str) -> str:
     if model_path.exists():
         return str(model_path)
 
-    cache_root = Path('/data/yuqihang/.cache/huggingface/hub')
-    repo_dir = cache_root / f"models--{model_name_or_path.replace('/', '--')}"
-    snapshots_dir = repo_dir / 'snapshots'
-    if snapshots_dir.exists():
-        snapshots = sorted(p for p in snapshots_dir.iterdir() if p.is_dir())
-        if snapshots:
-            return str(snapshots[-1])
+    cache_candidates = []
+    for env_key in ("HUGGINGFACE_HUB_CACHE", "HF_HUB_CACHE"):
+        env_value = os.getenv(env_key)
+        if env_value:
+            cache_candidates.append(Path(env_value).expanduser())
+    hf_home = os.getenv("HF_HOME")
+    if hf_home:
+        cache_candidates.append(Path(hf_home).expanduser() / "hub")
+    cache_candidates.append(Path.home() / ".cache" / "huggingface" / "hub")
+
+    for cache_root in cache_candidates:
+        repo_dir = cache_root / f"models--{model_name_or_path.replace('/', '--')}"
+        snapshots_dir = repo_dir / 'snapshots'
+        if snapshots_dir.exists():
+            snapshots = sorted(p for p in snapshots_dir.iterdir() if p.is_dir())
+            if snapshots:
+                return str(snapshots[-1])
 
     return model_name_or_path
 
@@ -123,9 +134,10 @@ def encode_queries_gpu(
 
     shared_cache = SharedEmbeddingCache(SHARED_CACHE_DB)
     resolved = _resolve_sentence_transformer_path(embedding_model_name)
-    model = SentenceTransformer(resolved, local_files_only=True, device='cuda')
+    model: SentenceTransformer | None = None
 
     def fetch_or_encode(queries: list[str]) -> np.ndarray:
+        nonlocal model
         cached = shared_cache.get_many(
             queries,
             model_name=embedding_model_name,
@@ -133,6 +145,8 @@ def encode_queries_gpu(
         )
         missing = [query for query in queries if query not in cached]
         if missing:
+            if model is None:
+                model = SentenceTransformer(resolved, local_files_only=True, device='cuda')
             encoded = model.encode(
                 missing,
                 batch_size=batch_size,
@@ -284,6 +298,7 @@ def train_global_backbone(
     batch_size: int = 512,
     lr: float = 2e-3,
     weight_decay: float = 1e-4,
+    loss_weights: dict[str, float] | None = None,
 ) -> tuple[GlobalCapabilityBackbone, dict]:
     device = torch.device('cuda')
     model = GlobalCapabilityBackbone(
@@ -301,6 +316,17 @@ def train_global_backbone(
     yt = torch.tensor(y_train, dtype=torch.float32, device=device)
     xv = torch.tensor(x_val, dtype=torch.float32, device=device)
     yv = torch.tensor(y_val, dtype=torch.float32, device=device)
+    resolved_loss_weights = {
+        "bce": 0.5,
+        "listwise": 1.0,
+        "base_listwise": 0.25,
+        "margin": 0.35,
+        "entropy": 0.04,
+        "balance": 0.05,
+        "ortho": 0.03,
+    }
+    if loss_weights:
+        resolved_loss_weights.update(loss_weights)
 
     best_state = None
     best_val_acc = -1.0
@@ -323,13 +349,13 @@ def train_global_backbone(
             ent_pen, balance_pen = anti_collapse_penalty(mix, entropy_floor=entropy_floor)
             ortho = factor_orthogonality_penalty(model.factor_to_model)
             loss = (
-                0.5 * bce
-                + 1.0 * listwise
-                + 0.25 * base_listwise
-                + 0.35 * margin
-                + 0.04 * ent_pen
-                + 0.05 * balance_pen
-                + 0.03 * ortho
+                resolved_loss_weights["bce"] * bce
+                + resolved_loss_weights["listwise"] * listwise
+                + resolved_loss_weights["base_listwise"] * base_listwise
+                + resolved_loss_weights["margin"] * margin
+                + resolved_loss_weights["entropy"] * ent_pen
+                + resolved_loss_weights["balance"] * balance_pen
+                + resolved_loss_weights["ortho"] * ortho
             )
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -358,6 +384,7 @@ def train_global_backbone(
     return model, {
         'val_acc': best_val_acc,
         'val_loss': best_val_loss,
+        'loss_weights': resolved_loss_weights,
         'history_tail': history[-5:],
     }
 

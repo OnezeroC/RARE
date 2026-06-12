@@ -2,97 +2,117 @@
 
 RARE stands for **Retrieval-Aware Routing with Sparse Expert Rectification**.
 
-This repository contains a compact research workspace for continuing reproduction and improvement of the RARE routing method on LLM routing benchmarks. It is extracted from a larger internal workspace and keeps only the core code needed to run the current RARE pipeline.
+This repository contains the latest research snapshot of the RARE router used in our `LLMRouterBench` reproduction and follow-up experiments.
 
-## Method Overview
-
-RARE is a two-stage router:
-
-1. **Retrieval-aware backbone**
-   - Encode the query.
-   - Retrieve nearest training examples.
-   - Build a neighbor performance profile over candidate models.
-   - Concatenate that profile with the query embedding and train a global router.
-
-2. **Sparse local rectification**
-   - Build a local residual correction candidate from retrieval neighbors.
-   - Use a learned gate to decide when the local correction is actually helpful.
-   - Trigger the second stage only on a small subset of queries.
-
-In short, RARE combines a retrieval-aware global router with a sparse local correction module.
-
-## Repository Layout
-
-```text
-RARE/
-├── run_rare_performance.py
-├── run_rare_performance_cost.py
-├── common/
-│   └── shared_embedding_cache.py
-└── src/
-    ├── glider_router.py
-    ├── glider_v2_router.py
-    └── rare_shared.py
-```
-
-## Main Entry Points
+## What Is Included
 
 - `run_rare_performance.py`
-  - Runs RARE on the `LLMRouterBench performance` setting.
+  - RARE on `LLMRouterBench performance`
 - `run_rare_performance_cost.py`
-  - Runs RARE on the `LLMRouterBench performance-cost` setting.
+  - RARE on `LLMRouterBench performance-cost`
+- `run_rare_cost_suite_aligned.py`
+  - paper-style cost-suite evaluation
+- `run_baselines_performance_cost.py`
+  - local baselines already aligned to the same official prompt split
+- `run_more_baselines_performance_cost.py`
+  - bridge runner for additional baselines such as `EmbedLLM` and `GraphRouter`
+- `build_llmrouterbench_performance_split_cache.py`
+  - build official 5-seed prompt-split caches for the `performance` setting
+- `export_avengers_official_data.py`
+  - export official prompt splits into Avengers-compatible files
 
-## Core Modules
+## Environment
 
-- `src/glider_router.py`
-  - Backbone training, local residual rectification, and embedding-cache-related logic reused by RARE.
-- `src/glider_v2_router.py`
-  - GPU kNN scoring utilities.
-- `src/rare_shared.py`
-  - Shared utilities for official splits, evaluation metrics, risk gating, and performance-cost data handling.
-- `common/shared_embedding_cache.py`
-  - SQLite-based shared embedding cache.
+This code assumes Python 3 with CUDA available for embedding and kNN-heavy runs.
 
-## Requirements
+Install minimal dependencies:
 
-This code is currently a research snapshot rather than a fully packaged release. The current pipeline assumes:
+```bash
+pip install -r requirements.txt
+```
 
-- Python 3
+Core packages:
+
 - `numpy`
 - `torch`
-- A CUDA-enabled environment for training and GPU kNN retrieval
-- Access to the embedding model used in the experiments:
-  - `gte_Qwen2-7B-instruct`
+- `pyyaml`
+- `pandas`
+- `sentence-transformers`
 
-## Data and Cache Setup
+## Required External Resources
 
-Large benchmark caches, local experiment results, reports, and internal handoff documents are intentionally **not** included in this public repository.
+This repository does not vendor the benchmark workspace or the embedding model.
 
-To run the scripts, you will need to prepare the following resources in your own environment:
+Set these environment variables before running:
 
-- Official `LLMRouterBench performance` split cache
-- Official `LLMRouterBench performance-cost` train/test split files
-- Embedding caches for the chosen embedding model
-- A writable SQLite embedding cache
+```bash
+export RARE_POOL_EXP_ROOT=/path/to/PoolExp
+export RARE_LLMROUTERBENCH_ROOT=/path/to/PoolExp/LLMRouterBench
+export RARE_EMBEDDING_MODEL=/path/to/gte_Qwen2-7B-instruct
+```
 
-The current codebase also contains local-path assumptions inherited from the original workspace, especially for the embedding model location. You may need to adjust these paths before running experiments in a fresh environment.
+If `RARE_LLMROUTERBENCH_ROOT` is unset, the code falls back to `${RARE_POOL_EXP_ROOT}/LLMRouterBench`.
 
-## Current Scope
+If `RARE_EMBEDDING_MODEL` is unset, the code tries these defaults:
 
-This repository is intended for:
+- `${RARE_POOL_EXP_ROOT}/models/gte_Qwen2-7B-instruct`
+- `../models/gte_Qwen2-7B-instruct`
 
-- reproducing the current RARE pipeline,
-- iterating on routing improvements,
-- and serving as a compact code release for the method.
+## Reproducing Official 5-Seed Runs
 
-It does not include:
+### 1. Build `performance` split caches
 
-- intermediate exploratory scripts from earlier development,
-- large cached artifacts,
-- benchmark result dumps,
-- or internal project handoff notes.
+```bash
+python build_llmrouterbench_performance_split_cache.py --split-seeds 42 999 2024 2025 3407
+```
+
+### 2. Run RARE on `performance`
+
+```bash
+for seed in 42 999 2024 2025 3407; do
+  python run_rare_performance.py --split-seed "$seed"
+done
+```
+
+### 3. Run RARE on `performance-cost`
+
+```bash
+for seed in 42 999 2024 2025 3407; do
+  python run_rare_performance_cost.py --split-seed "$seed"
+done
+```
+
+### 4. Run aligned local baselines on `performance-cost`
+
+```bash
+python run_baselines_performance_cost.py --methods avengers knn routerbench_mlp --seeds 42 999 2024 2025 3407
+```
+
+## Metric Convention
+
+For `LLMRouterBench performance-cost`, the primary metric in the current code is:
+
+- `dataset_avg`
+
+Auxiliary metric:
+
+- `sample_avg`
+
+This was changed to align local comparisons with `LLMRouterBench` dataset-level reporting.
+
+## Current Best Local 5-Seed Summary
+
+Under the unified official prompt split and `dataset_avg` reporting:
+
+- `RARE`: `69.78%`
+- `RouterBench-MLP`: `70.21%`
+- `Avengers`: `68.54%`
+- `Standard-kNN`: `66.46%`
+
+These numbers are from our local runs in this workspace and are not copied from paper tables.
 
 ## Notes
 
-- The code is organized around the current research workflow, not around a general-purpose package API.
-- If you plan to reuse it outside the original environment, start by checking path assumptions and data-loading utilities in `src/rare_shared.py`.
+- Large caches, benchmark dumps, and local experiment outputs are intentionally excluded from version control.
+- Some extra baseline runners depend on baseline code that lives in the external `LLMRouterBench` workspace.
+- `run_more_baselines_performance_cost.py` is a research bridge script and may need further cleanup for all third-party baselines.

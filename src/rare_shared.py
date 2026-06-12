@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 from pathlib import Path
 from typing import Any
@@ -12,9 +13,57 @@ import torch.nn.functional as F
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EMBEDDING_MODEL = str(ROOT.parents[0] / "models" / "gte_Qwen2-7B-instruct")
-PERF_SPLIT_CACHE_NPZ = ROOT / "data" / "hs_cache" / "llmrouterbench_performance_prompt_split_seed42_cache.npz"
-PERF_SPLIT_CACHE_META = ROOT / "data" / "hs_cache" / "llmrouterbench_performance_prompt_split_seed42_meta.json"
+
+
+def resolve_poolexp_root() -> Path:
+    env_override = os.getenv("RARE_POOL_EXP_ROOT")
+    if env_override:
+        return Path(env_override).expanduser().resolve()
+
+    candidate_paths = [
+        ROOT.parent / "PoolExp",
+        ROOT / "PoolExp",
+    ]
+    for path in candidate_paths:
+        if path.exists():
+            return path.resolve()
+    return candidate_paths[0].resolve()
+
+
+def resolve_llmrouterbench_root() -> Path:
+    env_override = os.getenv("RARE_LLMROUTERBENCH_ROOT")
+    if env_override:
+        return Path(env_override).expanduser().resolve()
+
+    candidate_paths = [
+        resolve_poolexp_root() / "LLMRouterBench",
+        ROOT.parent / "LLMRouterBench",
+    ]
+    for path in candidate_paths:
+        if path.exists():
+            return path.resolve()
+    return candidate_paths[0].resolve()
+
+
+def resolve_embedding_model() -> str:
+    env_override = os.getenv("RARE_EMBEDDING_MODEL")
+    if env_override:
+        return env_override
+
+    candidate_paths = [
+        resolve_poolexp_root() / "models" / "gte_Qwen2-7B-instruct",
+        ROOT.parent / "models" / "gte_Qwen2-7B-instruct",
+    ]
+    for path in candidate_paths:
+        if path.exists():
+            return str(path)
+    return str(candidate_paths[0])
+
+
+POOL_EXP_ROOT = resolve_poolexp_root()
+LLMROUTERBENCH_ROOT = resolve_llmrouterbench_root()
+EMBEDDING_MODEL = resolve_embedding_model()
+PAPER_PERFORMANCE_SEEDS = (42, 999, 2024, 2025, 3407)
 
 
 def set_seed(seed: int) -> None:
@@ -25,17 +74,28 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def load_official_cached_split() -> tuple[np.ndarray, list[str], dict[int, dict[str, object]], np.ndarray, list[str], dict[int, dict[str, object]], list[str]]:
-    if not PERF_SPLIT_CACHE_NPZ.exists() or not PERF_SPLIT_CACHE_META.exists():
+def performance_split_cache_paths(split_seed: int) -> tuple[Path, Path]:
+    cache_dir = ROOT / "data" / "hs_cache"
+    return (
+        cache_dir / f"llmrouterbench_performance_prompt_split_seed{split_seed}_cache.npz",
+        cache_dir / f"llmrouterbench_performance_prompt_split_seed{split_seed}_meta.json",
+    )
+
+
+def load_official_cached_split(
+    split_seed: int = 42,
+) -> tuple[np.ndarray, list[str], dict[int, dict[str, object]], np.ndarray, list[str], dict[int, dict[str, object]], list[str]]:
+    perf_split_cache_npz, perf_split_cache_meta = performance_split_cache_paths(split_seed)
+    if not perf_split_cache_npz.exists() or not perf_split_cache_meta.exists():
         raise FileNotFoundError(
-            f"Missing official split cache: {PERF_SPLIT_CACHE_NPZ} / {PERF_SPLIT_CACHE_META}"
+            f"Missing official split cache for seed {split_seed}: {perf_split_cache_npz} / {perf_split_cache_meta}"
         )
-    with np.load(PERF_SPLIT_CACHE_NPZ, allow_pickle=True) as data:
+    with np.load(perf_split_cache_npz, allow_pickle=True) as data:
         train_matrix = data["train_matrix"].astype(np.float32)
         test_matrix = data["test_matrix"].astype(np.float32)
         train_queries = data["train_queries"].tolist()
         test_queries = data["test_queries"].tolist()
-    meta = json.loads(PERF_SPLIT_CACHE_META.read_text())
+    meta = json.loads(perf_split_cache_meta.read_text())
     models = meta["models"]
     train_meta = {int(k): v for k, v in meta["train_meta"].items()}
     test_meta = {int(k): v for k, v in meta["test_meta"].items()}

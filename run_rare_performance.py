@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,10 @@ from src.rare_shared import (
 RESULT_JSON = ROOT / "results" / "result_rare_performance.json"
 
 
+def retrieval_knn_chunk_size() -> int:
+    return int(os.getenv("RARE_KNN_CHUNK_SIZE", "1024"))
+
+
 def augment_with_retrieval_features(
     x_train: np.ndarray,
     train_matrix: np.ndarray,
@@ -43,14 +48,35 @@ def augment_with_retrieval_features(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
     best = None
     best_payload = None
+    chunk_size = retrieval_knn_chunk_size()
     for k in [16, 24, 32]:
         for tau in [0.03, 0.05]:
-            tr_scores = knn_scores_leave_self(x_train, train_matrix, k=k, tau=tau)
-            val_scores = gpu_weighted_knn_scores(x_train=x_train, train_matrix=train_matrix, x_query=x_val, k=k, tau=tau, chunk_size=1024)
+            tr_scores = knn_scores_leave_self(
+                x_train,
+                train_matrix,
+                k=k,
+                tau=tau,
+                chunk_size=chunk_size,
+            )
+            val_scores = gpu_weighted_knn_scores(
+                x_train=x_train,
+                train_matrix=train_matrix,
+                x_query=x_val,
+                k=k,
+                tau=tau,
+                chunk_size=chunk_size,
+            )
             score = float(val_scores.max(axis=1).mean())
             if best is None or score > best:
                 best = score
-                test_scores = gpu_weighted_knn_scores(x_train=x_train, train_matrix=train_matrix, x_query=x_test, k=k, tau=tau, chunk_size=1024)
+                test_scores = gpu_weighted_knn_scores(
+                    x_train=x_train,
+                    train_matrix=train_matrix,
+                    x_query=x_test,
+                    k=k,
+                    tau=tau,
+                    chunk_size=chunk_size,
+                )
                 best_payload = (
                     np.concatenate([x_train, tr_scores], axis=1).astype(np.float32),
                     np.concatenate([x_val, val_scores], axis=1).astype(np.float32),
@@ -149,13 +175,26 @@ def local_delta_labels(global_logits: np.ndarray, local_logits: np.ndarray, targ
     return helpful, harmful, disagree
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run RARE on the LLMRouterBench performance setting.")
+    parser.add_argument("--split-seed", type=int, default=42, help="Official prompt-split seed.")
+    parser.add_argument(
+        "--result-json",
+        type=Path,
+        default=None,
+        help="Optional output path. Defaults to the seed42 file for seed 42, otherwise a seed-specific filename.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required.")
 
-    split_seed = 42
+    split_seed = int(args.split_seed)
     set_seed(split_seed)
-    train_matrix, train_queries, train_meta, test_matrix, test_queries, test_meta, models = load_official_cached_split()
+    train_matrix, train_queries, train_meta, test_matrix, test_queries, test_meta, models = load_official_cached_split(split_seed)
     x_train, x_test = encode_queries_gpu(
         train_queries,
         test_queries,
@@ -242,9 +281,18 @@ def main() -> None:
     final_logits = test_logits.copy()
     final_logits[use_local] = test_local_logits[use_local]
 
+    result_json = args.result_json
+    if result_json is None:
+        result_json = RESULT_JSON if split_seed == 42 else ROOT / "results" / f"result_rare_performance_seed{split_seed}.json"
+
     payload = {
         "method_name": "RARE",
         "setting": "LLMRouterBench performance",
+        "split_protocol": {
+            "name": "official_prompt_split",
+            "train_ratio": 0.7,
+            "split_seed": split_seed,
+        },
         "embedding_model": EMBEDDING_MODEL,
         "retrieval_cfg": ret_cfg,
         "stage1_training": train_meta_info,
@@ -266,8 +314,8 @@ def main() -> None:
             "use_local_rate": float(use_local.mean()),
         },
     }
-    RESULT_JSON.write_text(json.dumps(payload, indent=2))
-    print(json.dumps({"result_json": str(RESULT_JSON), "best_test": payload["best_test"]}, indent=2))
+    result_json.write_text(json.dumps(payload, indent=2))
+    print(json.dumps({"result_json": str(result_json), "best_test": payload["best_test"]}, indent=2))
 
 
 if __name__ == "__main__":

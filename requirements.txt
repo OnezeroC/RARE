@@ -1,0 +1,5 @@
+numpy
+torch
+pyyaml
+pandas
+sentence-transformers
