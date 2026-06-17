@@ -2,7 +2,7 @@
 
 RARE stands for **Retrieval-Aware Routing with Sparse Expert Rectification**.
 
-This repository contains the final `RARE` implementation and a minimal pipeline
+This repository contains the `RARE` implementation and a minimal pipeline
 for running it on `LLMRouterBench`.
 
 ## Setup
@@ -10,7 +10,7 @@ for running it on `LLMRouterBench`.
 GPU is required.
 
 ```bash
-conda activate rare-gpu
+conda activate rare
 pip install -r requirements.txt
 ```
 
