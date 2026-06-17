@@ -11,58 +11,48 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.cache.policy import resolve_split_cache_paths
+from src.config.paths import (
+    artifacts_cache_root,
+    artifacts_results_root,
+    embedding_model_path,
+    hf_home_root,
+    hf_modules_cache_root,
+    project_root,
+    third_party_root,
+)
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = project_root()
 
 
-def resolve_poolexp_root() -> Path:
-    env_override = os.getenv("RARE_POOL_EXP_ROOT")
+def resolve_local_hs_cache_root() -> Path:
+    env_override = os.getenv("RARE_HS_CACHE_ROOT")
     if env_override:
         return Path(env_override).expanduser().resolve()
+    return (artifacts_cache_root() / "hs_cache").resolve()
 
-    candidate_paths = [
-        ROOT.parent / "PoolExp",
-        ROOT / "PoolExp",
-    ]
-    for path in candidate_paths:
-        if path.exists():
-            return path.resolve()
-    return candidate_paths[0].resolve()
+
+def resolve_local_hf_home() -> Path:
+    return hf_home_root()
+
+
+def resolve_local_hf_modules_cache() -> Path:
+    return hf_modules_cache_root()
 
 
 def resolve_llmrouterbench_root() -> Path:
-    env_override = os.getenv("RARE_LLMROUTERBENCH_ROOT")
-    if env_override:
-        return Path(env_override).expanduser().resolve()
-
-    candidate_paths = [
-        resolve_poolexp_root() / "LLMRouterBench",
-        ROOT.parent / "LLMRouterBench",
-    ]
-    for path in candidate_paths:
-        if path.exists():
-            return path.resolve()
-    return candidate_paths[0].resolve()
+    return third_party_root()
 
 
 def resolve_embedding_model() -> str:
-    env_override = os.getenv("RARE_EMBEDDING_MODEL")
-    if env_override:
-        return env_override
-
-    candidate_paths = [
-        resolve_poolexp_root() / "models" / "gte_Qwen2-7B-instruct",
-        ROOT.parent / "models" / "gte_Qwen2-7B-instruct",
-    ]
-    for path in candidate_paths:
-        if path.exists():
-            return str(path)
-    return str(candidate_paths[0])
+    return embedding_model_path()
 
 
-POOL_EXP_ROOT = resolve_poolexp_root()
 LLMROUTERBENCH_ROOT = resolve_llmrouterbench_root()
 EMBEDDING_MODEL = resolve_embedding_model()
+HS_CACHE_ROOT = resolve_local_hs_cache_root()
+HF_HOME_ROOT = resolve_local_hf_home()
+HF_MODULES_CACHE_ROOT = resolve_local_hf_modules_cache()
 PAPER_PERFORMANCE_SEEDS = (42, 999, 2024, 2025, 3407)
 
 
@@ -75,11 +65,7 @@ def set_seed(seed: int) -> None:
 
 
 def performance_split_cache_paths(split_seed: int) -> tuple[Path, Path]:
-    cache_dir = ROOT / "data" / "hs_cache"
-    return (
-        cache_dir / f"llmrouterbench_performance_prompt_split_seed{split_seed}_cache.npz",
-        cache_dir / f"llmrouterbench_performance_prompt_split_seed{split_seed}_meta.json",
-    )
+    return resolve_split_cache_paths(setting="performance", split_seed=split_seed, train_ratio=0.7)
 
 
 def load_official_cached_split(

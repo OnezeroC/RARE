@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 from __future__ import annotations
 
 import argparse
@@ -15,25 +13,32 @@ import numpy as np
 import torch
 import yaml
 
-from run_rare_performance import (
-    augment_with_retrieval_features,
-    knn_scores_leave_self,
-    local_delta_features,
-    local_delta_labels,
-    retrieval_knn_chunk_size,
-)
-from src.glider_router import (
+from src.data.adaptors.response_records import build_response_feature_bundle
+from src.models.global_local_router import (
     encode_queries_gpu,
     infer_factor_features,
     infer_logits,
     local_residual_rectify,
     train_global_backbone,
 )
-from src.glider_v2_router import gpu_weighted_knn_scores
-from src.rare_shared import (
+from src.models.expert_fusion_router import gpu_weighted_knn_scores
+from src.methods.rare.performance import (
+    _build_override_features,
+    _candidate_list_hit_rate,
+    _candidate_prob_matrix,
+    _response_candidate_features,
+    augment_with_retrieval_features,
+    knn_scores_leave_self,
+    local_delta_features,
+    local_delta_labels,
+    retrieval_knn_chunk_size,
+)
+from src.methods.rare.response_rerank import union_shortlists
+from src.config.paths import artifacts_results_root
+from src.evaluation.performance_shared import model_usage_stats
+from src.shared import (
     EMBEDDING_MODEL,
     LLMROUTERBENCH_ROOT,
-    POOL_EXP_ROOT,
     ROOT,
     infer_risk,
     set_seed,
@@ -46,83 +51,10 @@ from src.rare_shared import (
 
 LLMRB_ROOT = LLMROUTERBENCH_ROOT
 CONFIG_PATH = LLMRB_ROOT / "config" / "baseline_config_performance_cost.yaml"
-BASE_COST_RESULT_JSON = POOL_EXP_ROOT / "result_cost_suite_llmrouterbench.json"
-RESULT_JSON = ROOT / "results" / "result_rare_performance_cost.json"
+BASE_COST_RESULT_JSON = artifacts_results_root() / "result_cost_suite_llmrouterbench.json"
+RESULT_JSON = artifacts_results_root() / "result_rare_performance_cost.json"
 ALPHAS = [0.0, 0.25, 0.39, 0.53, 0.8, 1.0]
 TRAIN_RATIO = 0.7
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run RARE on the LLMRouterBench performance-cost setting.")
-    parser.add_argument("--split-seed", type=int, default=42, help="Official prompt-split seed.")
-    parser.add_argument(
-        "--result-json",
-        type=Path,
-        default=None,
-        help="Optional output path. Defaults to the seed42 file for seed 42, otherwise a seed-specific filename.",
-    )
-    parser.add_argument("--local-k", type=int, default=24, help="Local residual rectification neighbor count.")
-    parser.add_argument("--local-alpha", type=float, default=1.0, help="Local residual rectification alpha.")
-    parser.add_argument("--local-tau", type=float, default=0.03, help="Local residual rectification tau.")
-    parser.add_argument(
-        "--local-uncertainty-threshold",
-        type=float,
-        default=2.0,
-        help="Local residual rectification uncertainty threshold.",
-    )
-    parser.add_argument(
-        "--gate-policy",
-        type=str,
-        default="quantile_masked",
-        choices=["quantile_masked", "quantile_nonzero_masked", "quantile_raw_disagree", "topk_raw_disagree"],
-        help="Policy used to sparsify the helpful gate into a local-rectification trigger set.",
-    )
-    parser.add_argument(
-        "--gate-threshold-quantile",
-        type=float,
-        default=0.95,
-        help="Calibration quantile used by quantile-based gate policies.",
-    )
-    parser.add_argument(
-        "--gate-target-rate",
-        type=float,
-        default=None,
-        help="Optional target trigger rate over the full split. Overrides gate-threshold-quantile for rate-based runs.",
-    )
-    parser.add_argument(
-        "--backbone-loss-preset",
-        type=str,
-        default="baseline",
-        choices=["baseline", "margin_heavy", "listwise_onlyish"],
-        help="Preset loss weights for the stage1 global backbone.",
-    )
-    parser.add_argument(
-        "--retrieval-feature-preset",
-        type=str,
-        default="perf_only",
-        choices=["perf_only", "perf_cost_concat", "utility_0.8"],
-        help="Retrieval profile used by the stage1 backbone in the performance-cost setting.",
-    )
-    parser.add_argument(
-        "--local-inference-mode",
-        type=str,
-        default="hard_switch",
-        choices=["hard_switch", "masked_blend", "soft_blend"],
-        help="How local rectification is merged into the final logits.",
-    )
-    parser.add_argument(
-        "--blend-beta",
-        type=float,
-        default=0.75,
-        help="Scale factor for blend-based local rectification modes.",
-    )
-    parser.add_argument(
-        "--blend-gamma",
-        type=float,
-        default=0.5,
-        help="Exponent applied to helpfulness scores in soft-blend mode.",
-    )
-    return parser.parse_args()
 
 
 def resolve_loader():
@@ -134,6 +66,46 @@ def resolve_loader():
     resolved["results_dir"] = str(LLMRB_ROOT / cfg["results_dir"])
     loader = BaselineDataLoader(config=resolved)
     return loader, resolved
+
+
+def split_records_by_dataset_then_prompt(
+    records: list[Any],
+    *,
+    train_ratio: float,
+    random_seed: int,
+) -> tuple[list[Any], list[Any]]:
+    if not 0.0 < train_ratio < 1.0:
+        raise ValueError(f"train_ratio must be between 0 and 1, got {train_ratio}")
+
+    rng = random.Random(random_seed)
+    dataset_groups: dict[str, list[Any]] = defaultdict(list)
+    for record in records:
+        dataset_groups[str(record.dataset_id)].append(record)
+
+    train_records: list[Any] = []
+    test_records: list[Any] = []
+    for dataset_id in sorted(dataset_groups):
+        dataset_records = dataset_groups[dataset_id]
+        prompt_to_records: dict[str, list[Any]] = defaultdict(list)
+        for record in dataset_records:
+            prompt_to_records[str(record.prompt)].append(record)
+
+        unique_prompts = sorted(
+            prompt_to_records,
+            key=lambda prompt: min(int(r.record_index) for r in prompt_to_records[prompt]),
+        )
+        n_train = int(len(unique_prompts) * train_ratio)
+        prompt_indices = list(range(len(unique_prompts)))
+        rng.shuffle(prompt_indices)
+        train_idx = set(prompt_indices[:n_train])
+
+        for idx, prompt in enumerate(unique_prompts):
+            if idx in train_idx:
+                train_records.extend(prompt_to_records[prompt])
+            else:
+                test_records.extend(prompt_to_records[prompt])
+
+    return train_records, test_records
 
 
 def build_payload(
@@ -196,66 +168,6 @@ def build_payload(
     }
 
 
-def load_official_split(split_seed: int) -> tuple[dict[str, Any], dict[str, Any]]:
-    loader, resolved_config = resolve_loader()
-    all_records = loader.load_all_records()
-    train_records, test_records = split_records_by_dataset_then_prompt(
-        records=all_records,
-        train_ratio=TRAIN_RATIO,
-        random_seed=split_seed,
-    )
-
-    configured_models = resolved_config.get("filters", {}).get("models") or []
-    observed_models = {str(record.model_name) for record in all_records}
-    models = [model_name for model_name in configured_models if model_name in observed_models]
-    if not models:
-        models = sorted(observed_models)
-
-    payload = build_payload(train_records, test_records, models)
-    refs = model_reference_table_from_records(test_records, models)
-    return payload, refs
-
-
-def split_records_by_dataset_then_prompt(
-    records: list[Any],
-    *,
-    train_ratio: float,
-    random_seed: int,
-) -> tuple[list[Any], list[Any]]:
-    if not 0.0 < train_ratio < 1.0:
-        raise ValueError(f"train_ratio must be between 0 and 1, got {train_ratio}")
-
-    rng = random.Random(random_seed)
-    dataset_groups: dict[str, list[Any]] = defaultdict(list)
-    for record in records:
-        dataset_groups[str(record.dataset_id)].append(record)
-
-    train_records: list[Any] = []
-    test_records: list[Any] = []
-    for dataset_id in sorted(dataset_groups):
-        dataset_records = dataset_groups[dataset_id]
-        prompt_to_records: dict[str, list[Any]] = defaultdict(list)
-        for record in dataset_records:
-            prompt_to_records[str(record.prompt)].append(record)
-
-        unique_prompts = sorted(
-            prompt_to_records,
-            key=lambda prompt: min(int(r.record_index) for r in prompt_to_records[prompt]),
-        )
-        n_train = int(len(unique_prompts) * train_ratio)
-        prompt_indices = list(range(len(unique_prompts)))
-        rng.shuffle(prompt_indices)
-        train_idx = set(prompt_indices[:n_train])
-
-        for idx, prompt in enumerate(unique_prompts):
-            if idx in train_idx:
-                train_records.extend(prompt_to_records[prompt])
-            else:
-                test_records.extend(prompt_to_records[prompt])
-
-    return train_records, test_records
-
-
 def model_reference_table_from_records(test_records: list[Any], models: list[str]) -> dict[str, Any]:
     by_model_scores: dict[str, list[float]] = defaultdict(list)
     by_model_costs: dict[str, list[float]] = defaultdict(list)
@@ -313,35 +225,24 @@ def model_reference_table_from_records(test_records: list[Any], models: list[str
     }
 
 
-def per_dataset_accuracy_from_idx(
-    selected_idx: np.ndarray,
-    matrix: np.ndarray,
-    meta: dict[int, dict[str, Any]],
-) -> dict[str, float]:
-    correct = {}
-    total = {}
-    for row_idx, model_idx in enumerate(selected_idx):
-        ds = meta[row_idx]["dataset"]
-        total[ds] = total.get(ds, 0) + 1
-        if matrix[row_idx, int(model_idx)] > 0:
-            correct[ds] = correct.get(ds, 0) + 1
-    return {ds: correct.get(ds, 0) / total[ds] for ds in sorted(total)}
+def load_official_split(split_seed: int) -> tuple[dict[str, Any], dict[str, Any]]:
+    loader, resolved_config = resolve_loader()
+    all_records = loader.load_all_records()
+    train_records, test_records = split_records_by_dataset_then_prompt(
+        records=all_records,
+        train_ratio=TRAIN_RATIO,
+        random_seed=split_seed,
+    )
 
+    configured_models = resolved_config.get("filters", {}).get("models") or []
+    observed_models = {str(record.model_name) for record in all_records}
+    models = [model_name for model_name in configured_models if model_name in observed_models]
+    if not models:
+        models = sorted(observed_models)
 
-def evaluate_selected(
-    selected_idx: np.ndarray,
-    test_perf: np.ndarray,
-    test_cost: np.ndarray,
-    test_meta: dict[int, dict[str, Any]],
-) -> dict[str, Any]:
-    per_dataset = per_dataset_accuracy_from_idx(selected_idx, test_perf, test_meta)
-    return {
-        "sample_avg": float(test_perf[np.arange(len(test_perf)), selected_idx].mean()),
-        "dataset_avg": float(np.mean(list(per_dataset.values()))),
-        "avg_cost": float(test_cost[np.arange(len(test_cost)), selected_idx].mean()),
-        "total_cost": float(test_cost[np.arange(len(test_cost)), selected_idx].sum()),
-        "per_dataset": per_dataset,
-    }
+    payload = build_payload(train_records, test_records, models)
+    refs = model_reference_table_from_records(test_records, models)
+    return payload, refs
 
 
 def normalize_perf_scores(perf_scores: np.ndarray) -> np.ndarray:
@@ -353,6 +254,29 @@ def normalize_perf_scores(perf_scores: np.ndarray) -> np.ndarray:
 def cost_score_matrix(cost_matrix: np.ndarray) -> np.ndarray:
     row_max = np.clip(cost_matrix.max(axis=1, keepdims=True), 1e-8, None)
     return 1.0 - (cost_matrix / row_max)
+
+
+def evaluate_selected(
+    selected_idx: np.ndarray,
+    test_perf: np.ndarray,
+    test_cost: np.ndarray,
+    test_meta: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
+    correct = {}
+    total = {}
+    for row_idx, model_idx in enumerate(selected_idx):
+        ds = test_meta[row_idx]["dataset"]
+        total[ds] = total.get(ds, 0) + 1
+        if test_perf[row_idx, int(model_idx)] > 0:
+            correct[ds] = correct.get(ds, 0) + 1
+    per_dataset = {ds: correct.get(ds, 0) / total[ds] for ds in sorted(total)}
+    return {
+        "sample_avg": float(test_perf[np.arange(len(test_perf)), selected_idx].mean()),
+        "dataset_avg": float(np.mean(list(per_dataset.values()))),
+        "avg_cost": float(test_cost[np.arange(len(test_cost)), selected_idx].mean()),
+        "total_cost": float(test_cost[np.arange(len(test_cost)), selected_idx].sum()),
+        "per_dataset": per_dataset,
+    }
 
 
 def alpha_sweep(
@@ -402,7 +326,11 @@ def summarize_curve(curve: dict[str, Any], refs: dict[str, Any]) -> dict[str, An
 def default_result_path(split_seed: int) -> Path:
     if split_seed == 42:
         return RESULT_JSON
-    return ROOT / "results" / f"result_rare_performance_cost_seed{split_seed}.json"
+    return artifacts_results_root() / f"result_rare_performance_cost_seed{split_seed}.json"
+
+
+def response_override_result_path(split_seed: int) -> Path:
+    return artifacts_results_root() / f"result_rare_performance_cost_seed{split_seed}_response_override.json"
 
 
 def backbone_loss_weights_from_args(args: argparse.Namespace) -> dict[str, float]:
@@ -719,8 +647,7 @@ def apply_local_inference_mode(
     }
 
 
-def main() -> None:
-    args = parse_args()
+def run(args: argparse.Namespace) -> dict[str, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required.")
 
@@ -730,7 +657,7 @@ def main() -> None:
     x_train, x_test = encode_queries_gpu(
         payload["train_queries"],
         payload["test_queries"],
-        batch_size=int(os.getenv("GLIDER_EMBED_BATCH_SIZE", "64")),
+        batch_size=int(os.getenv("RARE_EMBED_BATCH_SIZE", "64")),
         embedding_model_name=EMBEDDING_MODEL,
         cache_prefix=f"llmrouterbench_performance_cost_prompt_seed{split_seed}",
     )
@@ -799,7 +726,7 @@ def main() -> None:
         y_train=y_model_train,
         x_val=xval_ret,
         y_val=y_model_val,
-        batch_size=int(os.getenv("GLIDER_TRAIN_BATCH_SIZE", "2048")),
+        batch_size=int(os.getenv("RARE_TRAIN_BATCH_SIZE", "2048")),
         loss_weights=backbone_loss_weights,
     )
 
@@ -924,7 +851,296 @@ def main() -> None:
     result_json = args.result_json or default_result_path(split_seed)
     result_json.write_text(json.dumps(result, indent=2))
     print(json.dumps({"result_json": str(result_json), "summary": result["summary"]}, indent=2))
+    return result
 
 
-if __name__ == "__main__":
-    main()
+def run_response_override_variant(args: argparse.Namespace) -> dict[str, Any]:
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required.")
+
+    split_seed = int(args.split_seed)
+    set_seed(split_seed)
+    payload, refs = load_official_split(split_seed)
+    x_train, x_test = encode_queries_gpu(
+        payload["train_queries"],
+        payload["test_queries"],
+        batch_size=int(os.getenv("RARE_EMBED_BATCH_SIZE", "64")),
+        embedding_model_name=EMBEDDING_MODEL,
+        cache_prefix=f"llmrouterbench_performance_cost_prompt_seed{split_seed}",
+    )
+
+    models = list(payload["models"])
+    base_idx, meta_idx = split_indices(len(x_train), split_seed)
+    x_base = x_train[base_idx]
+    y_base = payload["train_perf"][base_idx]
+    x_meta_all = x_train[meta_idx]
+    y_meta_all = payload["train_perf"][meta_idx]
+    train_cost_base = payload["train_cost"][base_idx]
+    meta_queries = [payload["train_queries"][int(i)] for i in meta_idx.tolist()]
+    meta_meta = {
+        row_idx: payload["train_meta"][int(source_idx)]
+        for row_idx, source_idx in enumerate(meta_idx.tolist())
+    }
+
+    model_train_idx, model_val_idx = split_indices(len(x_base), split_seed + 1)
+    x_model_train = x_base[model_train_idx]
+    y_model_train = y_base[model_train_idx]
+    x_model_val = x_base[model_val_idx]
+    y_model_val = y_base[model_val_idx]
+    train_cost_model = train_cost_base[model_train_idx]
+
+    xtr_ret, xmeta_ret, xtest_ret, ret_cfg = augment_with_cost_aware_retrieval_features(
+        args=args,
+        x_train=x_model_train,
+        train_perf=y_model_train,
+        train_cost=train_cost_model,
+        x_val=x_meta_all,
+        x_test=x_test,
+    )
+    knn_chunk_size = retrieval_knn_chunk_size()
+    if args.retrieval_feature_preset == "perf_only":
+        xval_profile = gpu_weighted_knn_scores(
+            x_train=x_model_train,
+            train_matrix=y_model_train,
+            x_query=x_model_val,
+            k=int(ret_cfg["k"]),
+            tau=float(ret_cfg["tau"]),
+            chunk_size=knn_chunk_size,
+        )
+    elif args.retrieval_feature_preset == "perf_cost_concat":
+        train_retrieval_profile = np.concatenate(
+            [y_model_train.astype(np.float32), cost_score_matrix(train_cost_model.astype(np.float32))],
+            axis=1,
+        ).astype(np.float32)
+        xval_profile = gpu_weighted_knn_scores(
+            x_train=x_model_train,
+            train_matrix=train_retrieval_profile,
+            x_query=x_model_val,
+            k=int(ret_cfg["k"]),
+            tau=float(ret_cfg["tau"]),
+            chunk_size=knn_chunk_size,
+        )
+    elif args.retrieval_feature_preset == "utility_0.8":
+        train_retrieval_profile = utility_profile_matrix(y_model_train, train_cost_model, alpha=0.8)
+        xval_profile = gpu_weighted_knn_scores(
+            x_train=x_model_train,
+            train_matrix=train_retrieval_profile,
+            x_query=x_model_val,
+            k=int(ret_cfg["k"]),
+            tau=float(ret_cfg["tau"]),
+            chunk_size=knn_chunk_size,
+        )
+    else:
+        raise ValueError(f"Unsupported retrieval feature preset: {args.retrieval_feature_preset}")
+    xval_ret = np.concatenate([x_model_val, xval_profile], axis=1).astype(np.float32)
+    backbone_loss_weights = backbone_loss_weights_from_args(args)
+    model, stage1_meta = train_global_backbone(
+        x_train=xtr_ret,
+        y_train=y_model_train,
+        x_val=xval_ret,
+        y_val=y_model_val,
+        batch_size=int(os.getenv("RARE_TRAIN_BATCH_SIZE", "2048")),
+        loss_weights=backbone_loss_weights,
+    )
+
+    train_logits = infer_logits(model, xtr_ret)
+    meta_logits = infer_logits(model, xmeta_ret)
+    test_logits = infer_logits(model, xtest_ret)
+    local_cfg = {
+        "k": int(args.local_k),
+        "alpha": float(args.local_alpha),
+        "tau": float(args.local_tau),
+        "uncertainty_threshold": float(args.local_uncertainty_threshold),
+    }
+    meta_local_logits = local_residual_rectify(
+        train_embeddings=x_model_train,
+        train_targets=y_model_train,
+        train_logits=train_logits,
+        query_embeddings=x_meta_all,
+        query_logits=meta_logits,
+        **local_cfg,
+    )
+    test_local_logits = local_residual_rectify(
+        train_embeddings=x_model_train,
+        train_targets=y_model_train,
+        train_logits=train_logits,
+        query_embeddings=x_test,
+        query_logits=test_logits,
+        **local_cfg,
+    )
+
+    shortlist_k = int(os.getenv("RARE_RESPONSE_TOPK", "3"))
+    meta_bundle = build_response_feature_bundle(meta_meta, models=models, queries=meta_queries)
+    test_bundle = build_response_feature_bundle(payload["test_meta"], models=models, queries=payload["test_queries"])
+    meta_shortlists = union_shortlists([meta_logits, meta_local_logits], top_k=shortlist_k)
+    test_shortlists = union_shortlists([test_logits, test_local_logits], top_k=shortlist_k)
+    meta_features, meta_labels, meta_group_ids, meta_map, shortlist_meta = _response_candidate_features(
+        meta_shortlists,
+        meta_bundle["features"],
+        meta_bundle["predictions"],
+        [meta_logits, meta_local_logits],
+        y_meta_all,
+        include_relative=False,
+    )
+    test_features, _test_labels, _test_group_ids, test_map, shortlist_test = _response_candidate_features(
+        test_shortlists,
+        test_bundle["features"],
+        test_bundle["predictions"],
+        [test_logits, test_local_logits],
+        payload["test_perf"],
+        include_relative=False,
+    )
+
+    rng = np.random.default_rng(split_seed + 101)
+    unique_groups = np.unique(meta_group_ids)
+    rng.shuffle(unique_groups)
+    n_val_groups = max(64, int(len(unique_groups) * 0.2))
+    val_groups = set(int(v) for v in unique_groups[:n_val_groups].tolist())
+    train_idx = np.asarray([i for i, gid in enumerate(meta_group_ids.tolist()) if int(gid) not in val_groups], dtype=np.int64)
+    val_idx = np.asarray([i for i, gid in enumerate(meta_group_ids.tolist()) if int(gid) in val_groups], dtype=np.int64)
+    x_rr_train, x_rr_val = standardize_fit(meta_features[train_idx], meta_features[val_idx])
+    _, x_rr_test = standardize_fit(meta_features[train_idx], test_features)
+
+    risk_model, response_meta = train_risk_gate(
+        x_train=x_rr_train,
+        y_train=meta_labels[train_idx],
+        x_val=x_rr_val,
+        y_val=meta_labels[val_idx],
+        hidden_dim=128,
+        dropout=0.1,
+        epochs=160,
+        batch_size=1024,
+        lr=1e-3,
+        weight_decay=1e-4,
+    )
+    meta_candidate_probs = infer_risk(risk_model, standardize_fit(meta_features[train_idx], meta_features)[1])
+    test_candidate_probs = infer_risk(risk_model, x_rr_test)
+    meta_prob_matrix = _candidate_prob_matrix(len(meta_shortlists), len(models), meta_candidate_probs, meta_map)
+    test_prob_matrix = _candidate_prob_matrix(len(test_shortlists), len(models), test_candidate_probs, test_map)
+
+    meta_override_x, meta_override_target_idx = _build_override_features(
+        base_logits=meta_local_logits,
+        aux_logits=meta_logits,
+        candidate_prob_matrix=meta_prob_matrix,
+        shortlist_lists=meta_shortlists,
+        response_features=meta_bundle["features"],
+        predictions=meta_bundle["predictions"],
+    )
+    test_override_x, test_override_target_idx = _build_override_features(
+        base_logits=test_local_logits,
+        aux_logits=test_logits,
+        candidate_prob_matrix=test_prob_matrix,
+        shortlist_lists=test_shortlists,
+        response_features=test_bundle["features"],
+        predictions=test_bundle["predictions"],
+    )
+    base_choice_meta = np.argmax(meta_local_logits, axis=1)
+    override_success = y_meta_all[np.arange(len(y_meta_all)), meta_override_target_idx] > y_meta_all[np.arange(len(y_meta_all)), base_choice_meta]
+    val_group_mask = np.asarray([gid in val_groups for gid in range(len(meta_shortlists))], dtype=bool)
+    x_gate_train, x_gate_val = standardize_fit(meta_override_x[~val_group_mask], meta_override_x[val_group_mask])
+    _, x_gate_test = standardize_fit(meta_override_x[~val_group_mask], test_override_x)
+    gate_model, gate_meta = train_risk_gate(
+        x_train=x_gate_train,
+        y_train=override_success[~val_group_mask].astype(np.float32),
+        x_val=x_gate_val,
+        y_val=override_success[val_group_mask].astype(np.float32),
+        hidden_dim=96,
+        dropout=0.1,
+        epochs=120,
+        batch_size=512,
+        lr=1e-3,
+        weight_decay=1e-4,
+    )
+    val_gate_prob = infer_risk(gate_model, x_gate_val)
+    best_cfg = None
+    val_perf = y_meta_all[val_group_mask]
+    val_cost = payload["train_cost"][meta_idx][val_group_mask]
+    val_meta = {
+        row_idx: meta_meta[int(source_idx)]
+        for row_idx, source_idx in enumerate(np.flatnonzero(val_group_mask).tolist())
+    }
+    for threshold in [0.5, 0.55, 0.6, 0.65, 0.7, 0.75]:
+        chosen = base_choice_meta[val_group_mask].copy()
+        replace = val_gate_prob >= threshold
+        chosen[replace] = meta_override_target_idx[val_group_mask][replace]
+        val_curve = alpha_sweep(
+            np.eye(len(models), dtype=np.float32)[chosen],
+            val_perf,
+            val_cost,
+            val_meta,
+        )
+        best_val_point = max(val_curve.values(), key=lambda row: row["dataset_avg"])
+        score = float(best_val_point["dataset_avg"])
+        if best_cfg is None or score > best_cfg["val_best_accuracy_dataset_avg"]:
+            best_cfg = {
+                "threshold": float(threshold),
+                "val_best_accuracy_dataset_avg": score,
+                "val_best_accuracy_sample_avg": float(best_val_point["sample_avg"]),
+                "override_rate": float(replace.mean()),
+            }
+    assert best_cfg is not None
+
+    test_gate_prob = infer_risk(gate_model, x_gate_test)
+    base_choice_test = np.argmax(test_local_logits, axis=1)
+    final_idx = base_choice_test.copy()
+    replace = test_gate_prob >= float(best_cfg["threshold"])
+    final_idx[replace] = test_override_target_idx[replace]
+    final_scores = np.eye(len(models), dtype=np.float32)[final_idx]
+
+    curve = alpha_sweep(
+        final_scores,
+        payload["test_perf"],
+        payload["test_cost"],
+        payload["test_meta"],
+    )
+    summary = summarize_curve(curve, refs)
+    base_curve = alpha_sweep(
+        1.0 / (1.0 + np.exp(-test_local_logits)),
+        payload["test_perf"],
+        payload["test_cost"],
+        payload["test_meta"],
+    )
+    base_summary = summarize_curve(base_curve, refs)
+    response_hit = _candidate_list_hit_rate(test_shortlists, payload["test_perf"])
+
+    result = {
+        "method_name": "RARE-RESP-OVERRIDE",
+        "setting": "LLMRouterBench performance-cost",
+        "config_path": str(CONFIG_PATH),
+        "split_protocol": {
+            "name": "official_prompt_split",
+            "train_ratio": TRAIN_RATIO,
+            "split_seed": split_seed,
+        },
+        "embedding_model": EMBEDDING_MODEL,
+        "references": refs,
+        "alpha_grid": ALPHAS,
+        "curve": curve,
+        "summary": summary,
+        "training": {
+            "family": "rare_response_override",
+            "retrieval_cfg": ret_cfg,
+            "stage1_meta": stage1_meta,
+            "backbone_loss_preset": args.backbone_loss_preset,
+            "backbone_loss_weights": backbone_loss_weights,
+            "local_cfg": local_cfg,
+            "response_gate_meta": response_meta,
+            "override_gate_meta": gate_meta,
+            "override_cfg": best_cfg,
+            "shortlist_top_k": shortlist_k,
+            "shortlist_experts": ["global", "local"],
+            "response_shortlist_hit_rate": float(response_hit),
+            "always_local_summary": base_summary,
+            "test_override_rate": float(replace.mean()),
+            "avg_candidate_size_meta": shortlist_meta["avg_candidate_size"],
+            "avg_candidate_size_test": shortlist_test["avg_candidate_size"],
+            "knn_chunk_size": knn_chunk_size,
+        },
+        "frontier_source": str(BASE_COST_RESULT_JSON) if BASE_COST_RESULT_JSON.exists() else None,
+        "model_usage": model_usage_stats([models[int(idx)] for idx in final_idx]),
+    }
+
+    result_json = args.result_json or response_override_result_path(split_seed)
+    result_json.write_text(json.dumps(result, indent=2))
+    print(json.dumps({"result_json": str(result_json), "summary": result["summary"]}, indent=2))
+    return result

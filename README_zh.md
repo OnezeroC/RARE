@@ -1,18 +1,16 @@
 # RARE
 
-RARE stands for **Retrieval-Aware Routing with Sparse Expert Rectification**.
+RARE 的全称是 **Retrieval-Aware Routing with Sparse Expert Rectification**。
 
-This repository is now intentionally scoped to one thing only:
+当前仓库已经收敛为只做一件事：
 
-- the final `RARE` implementation
-- its integration entrypoint for `LLMRouterBench`
-- the minimal pipeline needed to prepare official splits and run RARE under
-  `performance` or `performance-cost`
+- 保留最终版 `RARE` 方法实现
+- 保留它与 `LLMRouterBench` 的评测接入入口
+- 保留最小可运行的 `prepare + run` 流程
 
-Other locally reimplemented baselines have been removed from the runtime
-pipeline.
+之前本地复现过的其他 baseline 运行逻辑，已经从主 pipeline 中移除。
 
-## Layout
+## 目录结构
 
 ```text
 RARE/
@@ -34,16 +32,16 @@ RARE/
 └── .hf_home/
 ```
 
-## Environment
+## 环境要求
 
-GPU is required for real runs.
+正式运行需要 GPU。
 
 ```bash
 conda activate rare-gpu
 pip install -r requirements.txt
 ```
 
-Core dependencies:
+核心依赖：
 
 - `numpy`
 - `torch`
@@ -51,9 +49,9 @@ Core dependencies:
 - `pandas`
 - `sentence-transformers`
 
-## Default Local Resources
+## 默认本地资源
 
-By default, the code resolves resources from this repository:
+默认从当前仓库解析以下资源：
 
 ```bash
 models/gte_Qwen2-7B-instruct/
@@ -61,21 +59,21 @@ models/gte_Qwen2-7B-instruct/
 artifacts/
 ```
 
-You must provide a local `LLMRouterBench` checkout yourself.
+`LLMRouterBench` 需要你自行在本地提供。
 
-Recommended layout:
+推荐目录形式：
 
 ```bash
 git clone https://github.com/ynulihao/LLMRouterBench.git third_party/LLMRouterBench
 ```
 
-or point the pipeline to an existing checkout:
+或者通过环境变量指定已有目录：
 
 ```bash
 export RARE_LLMROUTERBENCH_ROOT=/path/to/LLMRouterBench
 ```
 
-Optional overrides:
+也支持环境变量覆盖：
 
 ```bash
 export RARE_EMBEDDING_MODEL=/path/to/gte_Qwen2-7B-instruct
@@ -85,28 +83,28 @@ export HF_HOME=/path/to/.hf_home
 
 ## Pipeline
 
-The root entrypoint is:
+根入口是：
 
 ```bash
 python pipeline.py
 ```
 
-The pipeline now supports:
+当前 pipeline 只保留两个能力：
 
 - `prepare split-cache`
 - `run`
 
-`run` always executes the latest final `RARE` variant.
+其中 `run` 永远执行最新版最终 `RARE` 方法。
 
-## End-to-End Workflow
+## 标准流程
 
-All commands below assume:
+下面所有命令默认先执行：
 
 ```bash
 conda activate rare-gpu
 ```
 
-### 1. Build Official Split Caches
+### 1. 构建官方 split cache
 
 ```bash
 git clone https://github.com/ynulihao/LLMRouterBench.git third_party/LLMRouterBench
@@ -115,7 +113,7 @@ python pipeline.py prepare split-cache \
   --seeds 42 999 2024 2025 3407
 ```
 
-### 2. Run RARE on `performance`
+### 2. 运行 `performance`
 
 ```bash
 python pipeline.py run \
@@ -124,7 +122,7 @@ python pipeline.py run \
   --skip-existing
 ```
 
-### 3. Run RARE on `performance-cost`
+### 3. 运行 `performance-cost`
 
 ```bash
 python pipeline.py run \
@@ -133,9 +131,9 @@ python pipeline.py run \
   --skip-existing
 ```
 
-## Common Run Patterns
+## 常见运行方式
 
-Run a single seed and write to a custom result file:
+单个 seed 运行并输出到自定义结果文件：
 
 ```bash
 python pipeline.py run \
@@ -144,7 +142,7 @@ python pipeline.py run \
   --result-json artifacts/results/custom_rare_seed42.json
 ```
 
-Run `performance-cost` with custom RARE hyperparameters:
+在 `performance-cost` 下使用自定义 RARE 参数：
 
 ```bash
 python pipeline.py run \
@@ -163,14 +161,14 @@ python pipeline.py run \
   --blend-gamma 0.5
 ```
 
-## `prepare split-cache` Options
+## `prepare split-cache` 参数
 
 - `--seeds`
 - `--llmrouterbench-root`
 - `--config-path`
 - `--train-ratio`
 
-Example:
+示例：
 
 ```bash
 python pipeline.py prepare split-cache \
@@ -178,16 +176,16 @@ python pipeline.py prepare split-cache \
   --train-ratio 0.7
 ```
 
-## `run` Options
+## `run` 参数
 
-Core options:
+核心参数：
 
 - `--setting {performance,performance-cost}`
 - `--seeds`
 - `--skip-existing`
 - `--result-json`
 
-RARE tuning options:
+RARE 调参参数：
 
 - `--local-k`
 - `--local-alpha`
@@ -202,7 +200,7 @@ RARE tuning options:
 - `--blend-beta`
 - `--blend-gamma`
 
-Check the live CLI help for the exact current interface:
+以当前 CLI 为准：
 
 ```bash
 python pipeline.py run --help
