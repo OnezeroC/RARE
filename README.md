@@ -2,120 +2,40 @@
 
 RARE stands for **Retrieval-Aware Routing with Sparse Expert Rectification**.
 
-This repository is now intentionally scoped to one thing only:
+This repository contains the final `RARE` implementation and a minimal pipeline
+for running it on `LLMRouterBench`.
 
-- the final `RARE` implementation
-- its integration entrypoint for `LLMRouterBench`
-- the minimal pipeline needed to prepare official splits and run RARE under
-  `performance` or `performance-cost`
+## Setup
 
-Other locally reimplemented baselines have been removed from the runtime
-pipeline.
-
-## Layout
-
-```text
-RARE/
-├── pipeline.py
-├── README.md
-├── README_zh.md
-├── requirements.txt
-├── src/
-│   ├── cli/
-│   ├── config/
-│   ├── data/
-│   ├── evaluation/
-│   ├── methods/
-│   │   └── rare/
-│   ├── models/
-│   └── pipelines/
-├── artifacts/
-├── models/
-└── .hf_home/
-```
-
-## Environment
-
-GPU is required for real runs.
+GPU is required.
 
 ```bash
 conda activate rare-gpu
 pip install -r requirements.txt
 ```
 
-Core dependencies:
-
-- `numpy`
-- `torch`
-- `pyyaml`
-- `pandas`
-- `sentence-transformers`
-
-## Default Local Resources
-
-By default, the code resolves resources from this repository:
-
-```bash
-models/gte_Qwen2-7B-instruct/
-.hf_home/
-artifacts/
-```
-
-You must provide a local `LLMRouterBench` checkout yourself.
-
-Recommended layout:
+Prepare a local `LLMRouterBench` checkout:
 
 ```bash
 git clone https://github.com/ynulihao/LLMRouterBench.git third_party/LLMRouterBench
 ```
 
-or point the pipeline to an existing checkout:
+If your local path is different, set:
 
 ```bash
 export RARE_LLMROUTERBENCH_ROOT=/path/to/LLMRouterBench
 ```
 
-Optional overrides:
+## Run
+
+Build official split caches:
 
 ```bash
-export RARE_EMBEDDING_MODEL=/path/to/gte_Qwen2-7B-instruct
-export RARE_HS_CACHE_ROOT=/path/to/hs_cache
-export HF_HOME=/path/to/.hf_home
-```
-
-## Pipeline
-
-The root entrypoint is:
-
-```bash
-python pipeline.py
-```
-
-The pipeline now supports:
-
-- `prepare split-cache`
-- `run`
-
-`run` always executes the latest final `RARE` variant.
-
-## End-to-End Workflow
-
-All commands below assume:
-
-```bash
-conda activate rare-gpu
-```
-
-### 1. Build Official Split Caches
-
-```bash
-git clone https://github.com/ynulihao/LLMRouterBench.git third_party/LLMRouterBench
-
 python pipeline.py prepare split-cache \
   --seeds 42 999 2024 2025 3407
 ```
 
-### 2. Run RARE on `performance`
+Run `RARE` on `performance`:
 
 ```bash
 python pipeline.py run \
@@ -124,7 +44,7 @@ python pipeline.py run \
   --skip-existing
 ```
 
-### 3. Run RARE on `performance-cost`
+Run `RARE` on `performance-cost`:
 
 ```bash
 python pipeline.py run \
@@ -133,77 +53,9 @@ python pipeline.py run \
   --skip-existing
 ```
 
-## Common Run Patterns
-
-Run a single seed and write to a custom result file:
+For the exact live CLI:
 
 ```bash
-python pipeline.py run \
-  --setting performance \
-  --seeds 42 \
-  --result-json artifacts/results/custom_rare_seed42.json
-```
-
-Run `performance-cost` with custom RARE hyperparameters:
-
-```bash
-python pipeline.py run \
-  --setting performance-cost \
-  --seeds 42 999 2024 2025 3407 \
-  --local-k 24 \
-  --local-alpha 1.0 \
-  --local-tau 0.03 \
-  --local-uncertainty-threshold 2.0 \
-  --gate-policy quantile_masked \
-  --gate-threshold-quantile 0.95 \
-  --backbone-loss-preset baseline \
-  --retrieval-feature-preset perf_only \
-  --local-inference-mode hard_switch \
-  --blend-beta 0.75 \
-  --blend-gamma 0.5
-```
-
-## `prepare split-cache` Options
-
-- `--seeds`
-- `--llmrouterbench-root`
-- `--config-path`
-- `--train-ratio`
-
-Example:
-
-```bash
-python pipeline.py prepare split-cache \
-  --seeds 42 999 \
-  --train-ratio 0.7
-```
-
-## `run` Options
-
-Core options:
-
-- `--setting {performance,performance-cost}`
-- `--seeds`
-- `--skip-existing`
-- `--result-json`
-
-RARE tuning options:
-
-- `--local-k`
-- `--local-alpha`
-- `--local-tau`
-- `--local-uncertainty-threshold`
-- `--gate-policy`
-- `--gate-threshold-quantile`
-- `--gate-target-rate`
-- `--backbone-loss-preset`
-- `--retrieval-feature-preset`
-- `--local-inference-mode`
-- `--blend-beta`
-- `--blend-gamma`
-
-Check the live CLI help for the exact current interface:
-
-```bash
+python pipeline.py --help
 python pipeline.py run --help
 ```
